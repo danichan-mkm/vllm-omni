@@ -83,6 +83,19 @@ def split_wan_attention_qkv(qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     return query, key, value
 
 
+def _wan_vae_sdpa(query: torch.Tensor, key: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    # gfx1250 AOTriton has no head_dim > 256 SDPA kernels; use math.
+    if query.shape[-1] > 256 and torch.version.hip is not None:
+        from vllm.platforms.rocm import on_gfx1250
+
+        if on_gfx1250():
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            with sdpa_kernel(SDPBackend.MATH):
+                return F.scaled_dot_product_attention(query, key, value)
+    return F.scaled_dot_product_attention(query, key, value)
+
+
 def aligned_wan_attention_forward(self: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """``WanAttentionBlock.forward`` with SDPA inputs realigned when required.
 
@@ -96,7 +109,7 @@ def aligned_wan_attention_forward(self: nn.Module, x: torch.Tensor) -> torch.Ten
     hidden = x.permute(0, 2, 1, 3, 4).reshape(batch_size * time, channels, height, width)
     hidden = self.norm(hidden)
     query, key, value = align_sdpa_qkv(*split_wan_attention_qkv(self.to_qkv(hidden)))
-    hidden = F.scaled_dot_product_attention(query, key, value)
+    hidden = _wan_vae_sdpa(query, key, value)
 
     hidden = hidden.squeeze(1).permute(0, 2, 1).reshape(batch_size * time, channels, height, width)
     hidden = self.proj(hidden)
@@ -118,9 +131,9 @@ def install_wan_attention_sdpa_alignment(root: nn.Module) -> None:
     if getattr(root, _ROOT_ATTR, False):
         return
     diffusers_version = metadata.version("diffusers")
-    if diffusers_version != "0.40.0":
+    if diffusers_version != "0.42.1":
         warnings.warn(
-            "Wan attention SDPA alignment was validated against diffusers 0.40.0, "
+            "Wan attention SDPA alignment was validated against diffusers 0.42.1, "
             f"but {diffusers_version} is installed. The copied WanAttentionBlock.forward "
             "must be checked against this version for compatibility.",
             RuntimeWarning,

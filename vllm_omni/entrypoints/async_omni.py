@@ -1208,6 +1208,18 @@ class AsyncOmni(AsyncOmniBase, EngineClient):
         async with self._pause_cond:
             return self._paused
 
+    # vLLM process checkpointing (EngineClient, vLLM > 0.33) is not supported by Omni.
+    async def checkpoint_prepare(self, mode: str = "wait") -> str | None:
+        return "Process checkpointing is not supported by vLLM-Omni."
+
+    async def checkpoint_restore(self) -> None:
+        return None
+
+    async def checkpoint_state(self):
+        from vllm.v1.engine import CheckpointState
+
+        return CheckpointState.RUNNING, None
+
     # EngineClient exposes async operations; OmniBase implements the sync API.
     async def start_profile(  # type: ignore[override]
         self,
