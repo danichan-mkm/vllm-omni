@@ -1,0 +1,40 @@
+# vLLM-Omni on a gfx1250 vLLM image (ROCm/vllm docker/Dockerfile.rocm_gfx1250, target final).
+# vLLM-Omni targets the vLLM 0.34 release; vLLM main after the 0.34 cut changed APIs it uses.
+# BASE_IMAGE must be built from ROCm/vllm gfx1250-perf2-omni (v0.34.0 + gfx1250 patches).
+# Build from the repo root:
+#   docker build -f docker/Dockerfile.rocm_gfx1250 --build-arg BASE_IMAGE=<gfx1250 vLLM image> .
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+ARG COMMON_WORKDIR=/app
+
+# ROCm/vllm builds report a stale version, so check for APIs that vLLM main removed after 0.34.
+RUN python3 -c "from vllm.v1.kv_cache_interface import FullAttentionSpec; import vllm.v1.kv_cache_spec_registry" \
+    || { echo "BASE_IMAGE vLLM is newer than the 0.34 release"; exit 1; }
+
+RUN apt-get update -q -y && apt-get install -q -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep torch/triton/vllm/aiter from the base image.
+RUN pip3 list --format=freeze | grep -viE "^(diffusers|accelerate)==" > /tmp/omni-constraints.txt
+
+# The base image builds triton from source, which breaks torch's pin, so
+# torch-dependent packages go in with --no-deps. Audio extras are skipped.
+COPY requirements/common.txt /tmp/omni-common.txt
+RUN pip3 install --no-cache-dir --no-deps \
+        $(grep -E "^(cache-dit|kernels|torchsde|x-transformers|accelerate)\b" /tmp/omni-common.txt | tr -d " ") \
+        torch-einops-utils assoc-scan accelerated-scan \
+    && grep -vE "^\s*(#|$)|^(cache-dit|kernels|torchsde|x-transformers|accelerate|openai-whisper|cosmos-guardrail|s3tokenizer)\b" \
+        /tmp/omni-common.txt | tr -d " " > /tmp/omni-reqs.txt \
+    && pip3 install --no-cache-dir -c /tmp/omni-constraints.txt -r /tmp/omni-reqs.txt \
+        einx trampoline kernels-data sigstore tomlkit "setuptools-scm>=8"
+
+WORKDIR ${COMMON_WORKDIR}/vllm-omni
+COPY . .
+RUN VLLM_OMNI_TARGET_DEVICE=rocm pip3 install --no-cache-dir --no-deps --no-build-isolation . \
+    && python3 -c "import importlib.metadata as m; print('vllm-omni', m.version('vllm-omni'), 'diffusers', m.version('diffusers'))"
+
+# A0: hipBLASLt bf16 bias GEMMs fail B0->A0 translation.
+ENV DISABLE_ADDMM_CUDA_LT=1
+
+# vllm serve needs the model first: docker run <image> <model> --omni ...
+ENTRYPOINT ["vllm", "serve"]
